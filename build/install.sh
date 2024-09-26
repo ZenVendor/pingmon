@@ -15,4 +15,12 @@ echo "Copying binary to /usr/local/bin"
 cp ../test/pingmon /usr/local/bin/
 chmod 750 /usr/local/bin/pingmon
 
+echo "Copying service unit to /run/systemd/system"
+cp pingmon.service /run/systemd/system/
+chmod 640 /run/systemd/system/pingmon.service
+
+systemctl daemon-reload
+systemctl enable pingmon.service
+
+
 echo "End."

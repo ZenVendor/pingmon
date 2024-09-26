@@ -1,0 +1,14 @@
+[Unit]
+Description=Network connection monitoring
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/pingmon
+ConfigDirectory=/usr/local/etc/
+WorkingDirectory=/var/local/pingmon
+LogDirectory=/var/log
+Restart=on-success
+RestartSec=60
+
+[Install]
+WantedBy=default.target
