@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -17,126 +19,8 @@ const (
     MODE_OUTAGE
 )
 
-func StandardPing(site, insertQuery string, db *sql.DB, l *log.Logger) (mode int) {
+func LogToDB(dbFile string, mode int, p *probing.Pinger, stats *probing.Statistics) error {
 
-    pStd, err := probing.NewPinger(site)
-    if err != nil {
-        l.Fatal(err)
-    }
-    pStd.Count = 3
-    pStd.Size = 1000
-    pStd.Timeout = 5 * time.Second
-
-    pStd.OnFinish = func(stats *probing.Statistics) {
-        if stats.PacketsRecv == 0 {
-            mode = MODE_OUTAGE
-            l.Println("No response - switching to OUTAGE mode.")
-        }
-        if stats.PacketsRecv > 0 {
-            mode = MODE_STANDARD
-            _, err = db.Exec(insertQuery, 
-                time.Now(),
-                "standard",
-                stats.IPAddr.IP, 
-                pStd.Size, 
-                pStd.Count, 
-                stats.PacketsSent, 
-                stats.PacketsRecv, 
-                stats.MinRtt.Milliseconds(),
-                stats.MaxRtt.Milliseconds(),
-                stats.AvgRtt.Milliseconds(),
-            )
-            if err != nil {
-                l.Fatal(err)
-            }
-        }
-    }
-
-    err = pStd.Run()
-    if err != nil {
-        log.Fatal(err)
-    }
-    return mode
-}
-
-func OutagePing(site, insertQuery string, db *sql.DB, l *log.Logger) (mode int) {
-
-    pOut, err := probing.NewPinger(site)
-    if err != nil {
-        l.Fatal(err)
-    }
-    pOut.Count = 5
-    pOut.Size = 24
-    pOut.Interval = 3 * time.Second
-    pOut.Timeout = 15 * time.Second
-
-    pOut.OnFinish = func(stats *probing.Statistics) {
-        if stats.PacketsRecv < 5 {
-            mode = MODE_OUTAGE
-
-            _, err = db.Exec(insertQuery, 
-                time.Now(),
-                "outage",
-                stats.IPAddr.IP, 
-                pOut.Size, 
-                pOut.Count, 
-                stats.PacketsSent, 
-                stats.PacketsRecv, 
-                stats.MinRtt.Milliseconds(),
-                stats.MaxRtt.Milliseconds(),
-                stats.AvgRtt.Milliseconds(),
-            )
-            if err != nil {
-                l.Fatal(err)
-            }
-        }
-        if stats.PacketsRecv == 5 {
-            mode = MODE_STANDARD
-            l.Println("All packets received - returning to STANDARD mode")
-
-            _, err = db.Exec(insertQuery, 
-                time.Now(),
-                "outage",
-                stats.IPAddr.IP, 
-                pOut.Size, 
-                pOut.Count, 
-                stats.PacketsSent, 
-                stats.PacketsRecv, 
-                stats.MinRtt.Milliseconds(),
-                stats.MaxRtt.Milliseconds(),
-                stats.AvgRtt.Milliseconds(),
-            )
-            if err != nil {
-                l.Fatal(err)
-            }
-        }
-    }
-    err = pOut.Run()
-    if err != nil {
-        l.Fatal(err)
-    }
-    return mode
-}
-
-var db *sql.DB
-
-func main() {
-
-    envs, err := godotenv.Read()
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    logFile, err := os.OpenFile(envs["LOGFILE"], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer logFile.Close()
-
-    l := log.New(logFile, "pingmon: ", log.LstdFlags|log.Lshortfile)
-
-    site := envs["SITE"]
-    interval, _ := strconv.Atoi(envs["STDINTERVAL"])
     insertQuery := `
         insert into PingLog (
             logTime
@@ -151,23 +35,126 @@ func main() {
             , avgRTT
         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     `
+    pingType := "standard"
+    if mode == MODE_OUTAGE {
+        pingType = "outage"
+    }
 
-    db, err := sql.Open("sqlite3", envs["DBFILE"])
+    db, err := sql.Open("sqlite3", dbFile)
     if err != nil {
-        l.Fatal(err)
+        return err
     }
     defer db.Close()
 
-    mode := StandardPing(site, insertQuery, db, l)
+    _, err = db.Exec(insertQuery, 
+        time.Now(),
+        pingType,
+        stats.IPAddr.IP, 
+        p.Size, 
+        p.Count, 
+        stats.PacketsSent, 
+        stats.PacketsRecv, 
+        stats.MinRtt.Seconds(),
+        stats.MaxRtt.Seconds(),
+        stats.AvgRtt.Seconds(),
+    )
+    return err
+}
 
-    for {
-        switch mode {
-        case MODE_STANDARD:
-            time.Sleep(time.Duration(interval) * time.Second)
-            mode = StandardPing(site, insertQuery, db, l)
-        case MODE_OUTAGE: 
-            mode = OutagePing(site, insertQuery, db, l)
+func StandardPing(site, dbFile string, l *log.Logger) (mode int) {
+
+    p, err := probing.NewPinger(site)
+    if err != nil {
+        l.Fatal(err)
+    }
+    p.Count = 3
+    p.Size = 1000
+    p.Timeout = 5 * time.Second
+
+    p.OnFinish = func(stats *probing.Statistics) {
+        mode = MODE_STANDARD
+        if stats.PacketsRecv == 0 {
+            mode = MODE_OUTAGE
+            l.Println("SWITCHING to \033[38;5;9mOUTAGE\033[0m mode - all packets lost in the last batch.")
+        }
+        if err = LogToDB(dbFile, mode, p, stats); err != nil {
+            l.Fatal(err)
         }
     }
 
+    if err = p.Run(); err != nil {
+        l.Fatal(err)
+    }
+    return mode
+}
+
+func OutagePing(site, dbFile string, l *log.Logger) (mode int) {
+
+    p, err := probing.NewPinger(site)
+    if err != nil {
+        l.Fatal(err)
+    }
+    p.Count = 5
+    p.Size = 24
+    p.Interval = 3 * time.Second
+    p.Timeout = 15 * time.Second
+
+    p.OnFinish = func(stats *probing.Statistics) {
+        mode = MODE_OUTAGE
+        if stats.PacketsRecv == 5 {
+            mode = MODE_STANDARD
+            l.Println("SWITCHING to \033[38;5;40mSTANDARD\033[0m mode - all packets received in the last batch.")
+        }
+        if err = LogToDB(dbFile, mode, p, stats); err != nil {
+            l.Fatal(err)
+        }
+    }
+
+    if err = p.Run(); err != nil {
+        l.Fatal(err)
+    }
+
+    return mode
+}
+
+func main() {
+
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+
+    envs, err := godotenv.Read()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    logFile, err := os.OpenFile(envs["LOGFILE"], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer logFile.Close()
+
+    l := log.New(logFile, "pingmon: ", log.LstdFlags)
+
+    site := envs["SITE"]
+    dbFile := envs["DBFILE"]
+    interval, _ := strconv.Atoi(envs["STDINTERVAL"])
+
+    l.Printf("STARTING pingmon...\n\tSITE: %s\n\tDBFILE: %s\n", site, dbFile)
+
+    mode := StandardPing(site, dbFile, l)
+    for {
+        select {
+        case <-sigChan:
+            l.Printf("EXITING after signal\n")
+            return
+        case<-time.After(100 * time.Millisecond):
+            switch mode {
+            case MODE_STANDARD:
+                time.Sleep(time.Duration(interval) * time.Second)
+                mode = StandardPing(site, dbFile, l)
+            case MODE_OUTAGE: 
+                mode = OutagePing(site, dbFile, l)
+            }
+        }
+    }
 }
