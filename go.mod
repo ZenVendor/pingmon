@@ -3,9 +3,9 @@ module zenvendor/pingmon
 go 1.22.2
 
 require (
-	github.com/joho/godotenv v1.5.1
 	github.com/mattn/go-sqlite3 v1.14.23
 	github.com/prometheus-community/pro-bing v0.4.1
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
