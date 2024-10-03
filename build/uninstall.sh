@@ -6,7 +6,6 @@ systemctl disable pingmon.service
 
 echo "Moving data to $HOME/pingmon-uninstall"
 mkdir $HOME/pingmon-uninstall
-mv /var/log/pingmon.log $HOME/pingmon-uninstall/
 mv /var/local/pingmon/pingmon.db $HOME/pingmon-uninstall/
 mv /usr/local/etc/pingmon.conf $HOME/pingmon-uninstall/
 

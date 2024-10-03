@@ -20,8 +20,8 @@ const (
 
 type Config struct {
 	ConfigFile  string
+	Env         string `yaml:"env"`
 	DBFile      string `yaml:"dbfile"`
-	LogFile     string `yaml:"logfile"`
 	StdSite     string `yaml:"stdsite"`
 	StdInterval int    `yaml:"stdinterval"`
 	StdSize     int    `yaml:"stdsize"`
@@ -31,7 +31,21 @@ type Config struct {
 	OutCount    int    `yaml:"outcount"`
 }
 
-func (conf *Config) LogToDB(mode int, p *probing.Pinger, stats *probing.Statistics) error {
+func (conf *Config) LoadConfig() {
+	conf.ConfigFile = "/usr/local/etc/pingmon.conf"
+	if _, err := os.Stat("pingmon.conf"); !os.IsNotExist(err) {
+		conf.ConfigFile = "pingmon.conf"
+	}
+	f, err := os.ReadFile(conf.ConfigFile)
+	if err != nil {
+		log.Panicf("ERROR reading config file: %s\n", err)
+	}
+	if err = yaml.Unmarshal(f, conf); err != nil {
+		log.Panicf("ERROR processing YAML: %s\n", err)
+	}
+}
+
+func LogToDB(mode int, conf *Config, p *probing.Pinger, stats *probing.Statistics) error {
 
 	insertQuery := `
         insert into PingLog (
@@ -73,103 +87,125 @@ func (conf *Config) LogToDB(mode int, p *probing.Pinger, stats *probing.Statisti
 	return err
 }
 
-func (conf *Config) StandardPing(l *log.Logger) (mode int) {
+func StandardPing(conf *Config) (mode int) {
 
 	p, err := probing.NewPinger(conf.StdSite)
 	if err != nil {
-		l.Fatal(err)
+		log.Panicf("ERROR creating Standard Ping: %s\n", err)
 	}
 	p.Count = conf.StdCount
 	p.Size = conf.StdSize
 	p.Interval = 1 * time.Second
 	p.Timeout = time.Duration(2*conf.StdCount) * time.Second
 
+	if conf.Env == "test" {
+		p.OnSend = func(pkt *probing.Packet) {
+			log.Printf("Standard packet %d sent.\n", pkt.Seq)
+		}
+		p.OnRecv = func(pkt *probing.Packet) {
+			log.Printf("Standard packet %d received: %.4f\n", pkt.Seq, pkt.Rtt.Seconds())
+		}
+	}
 	p.OnFinish = func(stats *probing.Statistics) {
 		mode = MODE_STANDARD
 		if stats.PacketsRecv == 0 {
 			mode = MODE_OUTAGE
-			l.Println("SWITCHING to \033[38;5;9mOUTAGE\033[0m mode - all packets lost in the last batch.")
+			log.Println("SWITCHING to OUTAGE mode - all packets lost in the last batch.")
 		}
-		if err = conf.LogToDB(mode, p, stats); err != nil {
-			l.Fatal(err)
+		if err = LogToDB(mode, conf, p, stats); err != nil {
+			log.Panicf("ERROR logging to DB: %s\n", err)
+		}
+		if conf.Env == "test" {
+			log.Printf("Batch finished.\n")
 		}
 	}
 
 	if err = p.Run(); err != nil {
-		l.Fatal(err)
+		log.Panicf("ERROR Running Standard Ping: %s\n", err)
 	}
 	return mode
 }
 
-func (conf *Config) OutagePing(l *log.Logger) (mode int) {
+func OutagePing(conf *Config) (mode int) {
 
 	p, err := probing.NewPinger(conf.OutSite)
 	if err != nil {
-		l.Fatal(err)
+		log.Panicf("ERROR creating Outage Ping: %s\n", err)
 	}
 	p.Count = conf.OutCount
 	p.Size = 24
 	p.Interval = time.Duration(conf.OutInterval) * time.Second
 	p.Timeout = time.Duration(p.Count) * p.Interval
 
+	if conf.Env == "test" {
+		p.OnSend = func(pkt *probing.Packet) {
+			log.Printf("Outage packet %d sent.\n", pkt.Seq)
+		}
+		p.OnRecv = func(pkt *probing.Packet) {
+			log.Printf("Outage packet %d received: %.4f\n", pkt.Seq, pkt.Rtt.Seconds())
+		}
+	}
 	p.OnFinish = func(stats *probing.Statistics) {
 		mode = MODE_OUTAGE
 		if stats.PacketsRecv == conf.OutCount {
 			mode = MODE_STANDARD
-			l.Println("SWITCHING to \033[38;5;40mSTANDARD\033[0m mode - all packets received in the last batch.")
+			log.Println("SWITCHING to STANDARD mode - all packets received in the last batch.")
 		}
-		if err = conf.LogToDB(mode, p, stats); err != nil {
-			l.Fatal(err)
+		if err = LogToDB(mode, conf, p, stats); err != nil {
+			log.Panicf("ERROR logging to DB: %s\n", err)
+		}
+		if conf.Env == "test" {
+			log.Printf("Batch finished.\n")
 		}
 	}
 
 	if err = p.Run(); err != nil {
-		l.Fatal(err)
+		log.Panicf("ERROR running Outage Ping: %s\n", err)
 	}
 
 	return mode
 }
 
-var conf Config
-
 func main() {
+	var conf Config
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	conf.ConfigFile = "/usr/local/etc/pingmon.conf"
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
-	f, err := os.ReadFile(conf.ConfigFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err = yaml.Unmarshal(f, &conf); err != nil {
-		log.Fatal(err)
-	}
+	defer func() {
+		signal.Stop(sigChan)
+	}()
 
-	logFile, err := os.OpenFile(conf.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logFile.Close()
+	conf.LoadConfig()
+	log.Printf("STARTING pingmon...\n\tSITE: %s\n\tCONFIG: %s\n\tDB: %s\n", conf.StdSite, conf.ConfigFile, conf.DBFile)
 
-	l := log.New(logFile, "pingmon: ", log.LstdFlags)
-
-	l.Printf("STARTING pingmon...\n\tSITE: %s\n\tCONFIG: %s\n\tDB: %s\n\tLOG: %s\n", conf.StdSite, conf.ConfigFile, conf.DBFile, conf.LogFile)
-
-	mode := conf.StandardPing(l)
-	for {
-		select {
-		case <-sigChan:
-			l.Printf("EXITING after signal\n")
-			return
-		case <-time.After(100 * time.Millisecond):
-			switch mode {
-			case MODE_STANDARD:
-				time.Sleep(time.Duration(conf.StdInterval) * time.Second)
-				mode = conf.StandardPing(l)
-			case MODE_OUTAGE:
-				mode = conf.OutagePing(l)
+	go func() {
+		for {
+			select {
+			case s := <-sigChan:
+				switch s {
+				case syscall.SIGINT, syscall.SIGTERM:
+					log.Printf("EXITING - received %s.", s.String())
+					os.Exit(0)
+				case syscall.SIGHUP:
+					log.Printf("RELOADING CONFIG")
+					conf.LoadConfig()
+				}
 			}
+		}
+	}()
+
+	mode := StandardPing(&conf)
+	for {
+		switch mode {
+		case MODE_STANDARD:
+			if conf.Env == "test" {
+				log.Printf("Waiting %d seconds for next standard batch\n", conf.StdInterval)
+			}
+			time.Sleep(time.Duration(conf.StdInterval) * time.Second)
+			mode = StandardPing(&conf)
+		case MODE_OUTAGE:
+			mode = OutagePing(&conf)
 		}
 	}
 }
